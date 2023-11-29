@@ -1,20 +1,7 @@
-﻿
-using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic; // For HashSet<>
-using System.IO;
-using System.Linq; // For LINQ methods like Any()
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
-
-
-/*
+﻿/*
 File Version Manager
 --------------------
-
+ 
 Description:
 This program monitors a specified directory for file changes and creates versioned copies of files. 
 It is designed to work in tandem with companion Bash scripts for managing file versioning state and 
@@ -59,8 +46,6 @@ Companion Scripts:
 - `set-file-versioning.sh`: Used to enable or disable file versioning dynamically.
 
 */
-
-
 // COMPANION SCRIPTS:
 //
 // 1. purge-file-versions.sh
@@ -91,25 +76,43 @@ Companion Scripts:
 //           > File versioning set to disabled
 //
 
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic; // For HashSet<>
+using System.IO;
+using System.Linq; // For LINQ methods like Any()
+using System.Reflection.Metadata.Ecma335;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 
-class FileVersionManager
+namespace FVM
 {
-    private Timer checkEnvVariableTimer;
-    private bool versioningEnabled = false; // Start disabled
-    private bool old_versioningEnabled = true; // set old status to opposite to force an initial log messae
+    class FileVersionManager
+    {
+        private Timer checkEnvVariableTimer;
+        private bool versioningEnabled = false; // Start disabled
 
-    private FileSystemWatcher watcher;
-    private string targetDirectory = "/mnt/drive2/nextcloud/local-cache/Files"; // Set your target directory
-    private string logFile = "/var/log/create-file-versions.log"; // Set path to your log file
-    private Timer cleanupTimer;
+        private FileSystemWatcher watcher;
+        private string targetDirectory = "/mnt/drive2/nextcloud/local-cache/Files"; // Set your target directory
+        private string logFile = "/var/log/create-file-versions.log"; // Set path to your log file
+        private static string stateFile = "/etc/default/file-versioning-state.txt";
+        private Timer cleanupTimer;
 
-    private ConcurrentDictionary<string, DateTime> lastVersionTimes = new ConcurrentDictionary<string, DateTime>();
-    private ConcurrentDictionary<string, Task> fileTasks = new ConcurrentDictionary<string, Task>();
-    private HashSet<string> allowedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        private ConcurrentDictionary<string, DateTime> lastVersionTimes = new ConcurrentDictionary<string, DateTime>();
+        private ConcurrentDictionary<string, Task> fileTasks = new ConcurrentDictionary<string, Task>();
+        private List<Regex> pathExclusions = new List<Regex>();
+        private string exclusionsFilePath = "/home/npepin/.create-file-versions/exclusions.txt"; // Set the path to your exclusions file
+
+        private HashSet<string> allowedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
     // Microsoft Office
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".mdb", ".accdb", ".pub", ".one", // Legacy Microsoft Office
+    ".mdb", ".accdb", ".pub", ".one", 
+    
+    // Legacy Microsoft Office
     ".docm", ".dotx", ".dotm", ".xlsm", ".xltm", ".pptm", ".osts",
     
     // Microsoft OneNote
@@ -209,263 +212,331 @@ class FileVersionManager
     ".drawio", // draw.io File
 };
 
-    public FileVersionManager()
-    {
-        watcher = new FileSystemWatcher(targetDirectory)
+        public FileVersionManager(bool initVerState)
         {
-            NotifyFilter = NotifyFilters.LastWrite,
-            Filter = "*.*",
-            IncludeSubdirectories = true // Enable recursive monitoring
-        };
 
-        watcher.Changed += OnChanged;
-        watcher.EnableRaisingEvents = true;
-        LogAndConsole($"Monitoring started on: {targetDirectory}");
-        checkEnvVariableTimer = new Timer(CheckVersioningStatus, null, TimeSpan.Zero, TimeSpan.FromMinutes(1)); // Check every minute
-        cleanupTimer = new Timer(_ => CleanupCompletedTasks(), null, TimeSpan.Zero, TimeSpan.FromMinutes(10)); // Every 10 minutes
-    }
+            LoadExclusions(exclusionsFilePath);
 
-    private void OnChanged(object source, FileSystemEventArgs e)
-    {
-        LogAndConsole($"Change detected: {e.FullPath}");
+            versioningEnabled = initVerState;
+            LogAndConsole($"Monitoring started on: {targetDirectory}");
+            LogAndConsole($"Initial versioning state is: {(versioningEnabled ? "enabled" : "disabled")}");
 
-        string fileName = Path.GetFileName(e.FullPath);
-        if (IsTemporaryFile(fileName) || !allowedExtensions.Contains(Path.GetExtension(fileName)) || IsInDotDirectory(e.FullPath))
-        {
-            // LogAndConsole($"Ignoring temporary or versioned file: {e.Name}");
-            return;
+            watcher = new FileSystemWatcher(targetDirectory)
+            {
+                NotifyFilter = NotifyFilters.LastWrite,
+                Filter = "*.*",
+                IncludeSubdirectories = true // Enable recursive monitoring
+            };
+            watcher.InternalBufferSize = 64 * 1024;
+            watcher.Changed += OnChanged;
+            watcher.EnableRaisingEvents = true;
+            checkEnvVariableTimer = new Timer(CheckVersioningStatus, null, TimeSpan.Zero, TimeSpan.FromMinutes(1)); // Check every minute
+            cleanupTimer = new Timer(_ => CleanupCompletedTasks(), null, TimeSpan.Zero, TimeSpan.FromMinutes(10)); // Every 10 minutes
         }
 
-        CleanupCompletedTasks();
-
-        if (!fileTasks.ContainsKey(e.FullPath))
+        private void LoadExclusions(string filePath)
         {
-            var task = ProcessFileChangeAsync(e.FullPath);
-            if (fileTasks.TryAdd(e.FullPath, task))
+            if (!File.Exists(filePath))
             {
-                // If successfully added, await the task's completion and then remove it from the dictionary
-                task.ContinueWith(_ => fileTasks.TryRemove(e.FullPath, out _));
+                // Create a blank file if it does not exist
+                File.Create(filePath).Close();
+                // Optionally, log or inform that a new blank exclusions file has been created
+                Console.WriteLine($"Created a new blank exclusions file at: {filePath}");
             }
-        }
-    }
-    private bool IsTemporaryFile(string fileName)
-    {
-        // Check for standard temporary file patterns
-        if (fileName.StartsWith("~$") || fileName.StartsWith(".~"))
-        {
-            return true;
-        }
 
-        // Regular expression to match the pattern '~~~~123' before the file extension
-        var versionPattern = new Regex(@"~~~~\d{3}(?=\.[^\.]+$)");
-        return versionPattern.IsMatch(fileName);
-    }
-    private void CleanupCompletedTasks()
-    {
-        foreach (var key in fileTasks.Keys)
-        {
-            if (fileTasks[key].IsCompleted)
+            foreach (string line in File.ReadAllLines(filePath))
             {
-                fileTasks.TryRemove(key, out _);
-            }
-        }
-    }
-    private void CheckVersioningStatus(object state)
-    {
-        try
-        {
-            string statusFilePath = "/etc/default/file-versioning-state.txt"; // Path to the status file
-            if (File.Exists(statusFilePath))
-            {
-                string status = File.ReadAllText(statusFilePath).Trim();
-                versioningEnabled = (status.ToLower() == "enabled");
-                if (versioningEnabled != old_versioningEnabled)
+                if (!string.IsNullOrWhiteSpace(line))
                 {
-                    LogAndConsole($"File versioning is now {(versioningEnabled ? "enabled" : "disabled")}");
-                    old_versioningEnabled = versioningEnabled;
+                    pathExclusions.Add(new Regex(line, RegexOptions.IgnoreCase));
                 }
             }
-            else
-            {
-                // turn off versioning if the file does not exist
-                old_versioningEnabled = versioningEnabled;
-                versioningEnabled = false;
-                LogAndConsole($"Status file is missing, so versioning is disabled. Please create this file containing either 'enabled' or 'disabled' in it: {statusFilePath}");
-            }
         }
-        catch (Exception ex)
-        {
-            // turn off versioning if the file can't be read
-            old_versioningEnabled = versioningEnabled;
-            versioningEnabled = false;
-            LogAndConsole($"Error reading status file so versioning is disabled. The exception is: {ex.Message}");
-        }
-    }
-    private bool IsInDotDirectory(string filePath)
-    {
-        var directory = Path.GetDirectoryName(filePath);
 
-        // Check if any part of the directory path starts with a dot
-        return directory.Split(Path.DirectorySeparatorChar).Any(dir => dir.StartsWith("."));
-    }
-    private bool ShouldFileVersion(string filePath)
-    {
-        if (lastVersionTimes.TryGetValue(filePath, out DateTime lastVersionTime))
+        public static bool _CheckVersioningStatus()
         {
-            return (DateTime.Now - lastVersionTime).TotalMinutes >= 2;
-        }
-        return true;
-    }
-    private async Task ProcessFileChangeAsync(string filePath)
-    {
-        try
-        {
-            if (!ShouldFileVersion(filePath))
-            {
-                LogAndConsole($"Skipping versioning for {filePath} as a version was created recently.");
-                return;
-            }
-
-            string versionedFilePath = CreateVersionedFilePath(filePath);
-            if (string.IsNullOrEmpty(versionedFilePath)) return;
-
-            if (await TryCopyFileWithTimeoutAsync(filePath, versionedFilePath, TimeSpan.FromMinutes(20)))
-            {
-                LogAndConsole($"Versioned file created: {versionedFilePath}");
-                lastVersionTimes[filePath] = DateTime.Now;
-            }
-            else
-            {
-                LogAndConsole($"Failed to create versioned file for: {filePath}");
-            }
-        }
-        catch (Exception ex)
-        {
-            LogAndConsole($"Error: {ex.Message}");
-        }
-    }
-    private string CreateVersionedFilePath(string filePath)
-    {
-        string directory = Path.GetDirectoryName(filePath);
-        string fileName = Path.GetFileNameWithoutExtension(filePath);
-        string extension = Path.GetExtension(filePath);
-
-        int versionNumber = 1;
-        string versionedFilePath;
-        do
-        {
-            versionedFilePath = Path.Combine(directory, $".{fileName}~~~~{versionNumber:D3}{extension}");
-            versionNumber++;
-        } while (File.Exists(versionedFilePath));
-
-        return versionedFilePath;
-    }
-    private async Task<bool> TryCopyFileWithTimeoutAsync(string sourcePath, string destinationPath, TimeSpan timeout)
-    {
-        using (var cts = new CancellationTokenSource(timeout))
-        {
+            bool versioningEnabled = false;
             try
             {
-                using (var sourceStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.None))
+                string statusFilePath = stateFile; // Path to the status file
+                if (File.Exists(statusFilePath))
                 {
-                    using (var destinationStream = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    {
-                        await sourceStream.CopyToAsync(destinationStream, cts.Token);
-                    }
+                    string status = File.ReadAllText(statusFilePath).Trim();
+                    versioningEnabled = (status.ToLower() == "enabled");
                 }
-
-                // Setting permissions and ownership using Bash commands
-                SetPermissionsAndOwnership(sourcePath, destinationPath);
-
-                return true;
-            }
-            catch (OperationCanceledException)
-            {
-                LogAndConsole($"Timeout occurred while copying: {sourcePath}");
-                return false;
             }
             catch (Exception ex)
             {
-                LogAndConsole($"Exception during file copy: {ex.Message}");
-                return false;
+            }
+            return versioningEnabled;
+        }
+        private void CheckVersioningStatus(object state)
+        {
+            bool old_versioningEnabled = versioningEnabled;
+            bool new_versioningEnabled = _CheckVersioningStatus();
+
+            if (new_versioningEnabled != old_versioningEnabled)
+            {
+                versioningEnabled = new_versioningEnabled;
+                LogAndConsole($"File versioning changed to {(versioningEnabled ? "enabled" : "disabled")}");
+            }
+            else
+            {
+                // LogAndConsole($"File versioning already {(versioningEnabled ? "enabled" : "disabled")}");
+            }
+
+        }
+
+        private void OnChanged(object source, FileSystemEventArgs e)
+        {
+            LogAndConsole($"*** Change detected: {e.FullPath}");
+
+            string filePath = e.FullPath;
+
+            if (!versioningEnabled)
+            {
+                LogAndConsole("-> Ignored, versioning disabled");
+                return;
+            }
+            if (IsTemporaryFile(filePath))
+            {
+                LogAndConsole("-> Ignored, is a temporary file");
+                return;
+            }
+            else if (IsInDotDirectory(filePath))
+            {
+                LogAndConsole("-> Ignored, is a hidden dot directory");
+                return;
+            }
+            else if (!allowedExtensions.Contains(Path.GetExtension(filePath))) 
+            {
+                LogAndConsole("-> Ignored, is not an allowed extension");
+                return;
+
+            } else if (IsExcludedPath(filePath))
+            {
+                LogAndConsole("-> Ignored, is an exluded path");
+                return;
+            }
+
+            CleanupCompletedTasks();
+
+            if (!fileTasks.ContainsKey(filePath))
+            {
+                var task = ProcessFileChangeAsync(filePath);
+                if (fileTasks.TryAdd(filePath, task))
+                {
+                    task.ContinueWith(_ => fileTasks.TryRemove(filePath, out _));
+                }
             }
         }
-    }
-    private string EscapeForBash(string path)
-    {
-        // string escapedPath = '\u0022' + Regex.Replace(path, "([ \"])", @"\\$1") + '\u0022'; 
-        string escapedPath = '\u0027' + path + '\u0027';
-        return (escapedPath);
-    }
-    private void SetPermissionsAndOwnership(string sourcePath, string destinationPath)
-    {
-        var escapedSourcePath = EscapeForBash(sourcePath);
-        var escapedDestinationPath = EscapeForBash(destinationPath);
-        // LogAndConsole($"Escaped Source Path:               {escapedSourcePath}");
-        // LogAndConsole($"Escaped Destination Path:          {escapedDestinationPath}");
 
-        // Getting permissions from the source file
-        var getPermsCommand = $"stat -c %a {escapedSourcePath}";
-        // LogAndConsole($"Perms command for Source:          {getPermsCommand}");
-        var permissions = ExecuteBashCommand(getPermsCommand);
-        // LogAndConsole($" --- Returned Perms:               {permissions}");
-
-        // Setting permissions for the destination file
-        var setPermsCommand = $"chmod {permissions} {escapedDestinationPath}";
-        // LogAndConsole($"Set Perms command for Destination: {getPermsCommand}");
-        ExecuteBashCommand(setPermsCommand);
-
-        // Getting ownership from the source file
-        var getOwnerCommand = $"stat -c %U {escapedSourcePath}";
-        // LogAndConsole($"Owner command for Source:          {getOwnerCommand}");
-        var owner = ExecuteBashCommand(getOwnerCommand);
-        // LogAndConsole($" --- Returned Owner:               {owner}");
-
-        var getGroupCommand = $"stat -c %G {escapedSourcePath}";
-        // LogAndConsole($"Group command for Source:          {getGroupCommand}");
-        var group = ExecuteBashCommand(getGroupCommand);
-        // LogAndConsole($" --- Returned Group:               {group}");
-
-        // Setting ownership for the destination file
-        var setOwnerCommand = $"chown {owner}:{group} {escapedDestinationPath}";
-        // LogAndConsole($"Set Owner command for Destination  {getGroupCommand}");
-        ExecuteBashCommand(setOwnerCommand);
-    }
-    private string ExecuteBashCommand(string command)
-    {
-        using (var process = new System.Diagnostics.Process())
+        private bool IsExcludedPath(string path)
         {
-            process.StartInfo = new System.Diagnostics.ProcessStartInfo
+            return pathExclusions.Any(regex => regex.IsMatch(path));
+        }
+
+        private bool IsTemporaryFile(string fileName)
+        {
+            // Check for standard temporary file patterns
+            if (fileName.StartsWith("~$") || fileName.StartsWith(".~"))
             {
-                FileName = "/bin/bash",
-                Arguments = $"-c \"{command}\"",
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
+                return true;
+            }
 
-            process.Start();
-            string result = process.StandardOutput.ReadToEnd();
-            process.WaitForExit();
-
-            return result.Trim();
+            // Regular expression to match the pattern '~~~~123' before the file extension
+            var versionPattern = new Regex(@"~~~~\d{3}(?=\.[^\.]+$)");
+            return versionPattern.IsMatch(fileName);
         }
-    }
-    private void LogAndConsole(string message)
-    {
-        string logMessage = $"{DateTime.Now}: {message}\n";
-        Console.WriteLine(logMessage);
-        File.AppendAllText(logFile, logMessage);
-    }
-    static void Main()
-    {
-        var fileVersionManager = new FileVersionManager();
-        Console.WriteLine("Press Ctrl+C to exit.");
 
-        // Option 1: Simple infinite loop
-        while (true)
+        private bool IsInDotDirectory(string filePath)
         {
-            Thread.Sleep(Timeout.Infinite);
+            var directory = Path.GetDirectoryName(filePath);
+
+            // Check if any part of the directory path starts with a dot
+            return directory.Split(Path.DirectorySeparatorChar).Any(dir => dir.StartsWith("."));
         }
+
+        private void CleanupCompletedTasks()
+        {
+            foreach (var key in fileTasks.Keys)
+            {
+                if (fileTasks[key].IsCompleted)
+                {
+                    fileTasks.TryRemove(key, out _);
+                }
+            }
+        }
+
+        private bool ShouldFileVersion(string filePath)
+        {
+            if (lastVersionTimes.TryGetValue(filePath, out DateTime lastVersionTime))
+            {
+                return (DateTime.Now - lastVersionTime).TotalMinutes >= 1;
+            }
+            return true;
+        }
+
+        private async Task ProcessFileChangeAsync(string filePath)
+        {
+            try
+            {
+                if (!ShouldFileVersion(filePath))
+                {
+                    LogAndConsole($"Skipping versioning for {filePath} as a version was created recently.");
+                    return;
+                }
+
+                string versionedFilePath = CreateVersionedFilePath(filePath);
+                if (string.IsNullOrEmpty(versionedFilePath)) return;
+
+                if (await TryCopyFileWithTimeoutAsync(filePath, versionedFilePath, TimeSpan.FromMinutes(20)))
+                {
+                    LogAndConsole($"Versioned file created: {versionedFilePath}");
+                    lastVersionTimes[filePath] = DateTime.Now;
+                }
+                else
+                {
+                    LogAndConsole($"Failed to create versioned file for: {filePath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogAndConsole($"Error: {ex.Message}");
+            }
+        }
+
+        private string CreateVersionedFilePath(string filePath)
+        {
+            string directory = Path.GetDirectoryName(filePath);
+            string fileName = Path.GetFileNameWithoutExtension(filePath);
+            string extension = Path.GetExtension(filePath);
+
+            int versionNumber = 1;
+            string versionedFilePath;
+            do
+            {
+                versionedFilePath = Path.Combine(directory, $".{fileName}~~~~{versionNumber:D3}{extension}");
+                versionNumber++;
+            } while (File.Exists(versionedFilePath));
+
+            return versionedFilePath;
+        }
+
+        private async Task<bool> TryCopyFileWithTimeoutAsync(string sourcePath, string destinationPath, TimeSpan timeout)
+        {
+            using (var cts = new CancellationTokenSource(timeout))
+            {
+                try
+                {
+                    using (var sourceStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        using (var destinationStream = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                        {
+                            await sourceStream.CopyToAsync(destinationStream, cts.Token);
+                        }
+                    }
+
+                    // Setting permissions and ownership using Bash commands
+                    SetPermissionsAndOwnership(sourcePath, destinationPath);
+
+                    return true;
+                }
+                catch (OperationCanceledException)
+                {
+                    LogAndConsole($"Timeout occurred while copying: {sourcePath}");
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    LogAndConsole($"Exception during file copy: {ex.Message}");
+                    return false;
+                }
+            }
+        }
+
+        private string EscapeForBash(string path)
+        {
+            // string escapedPath = '\u0022' + Regex.Replace(path, "([ \"])", @"\\$1") + '\u0022'; 
+            string escapedPath = '\u0027' + path + '\u0027';
+            return (escapedPath);
+        }
+
+        private void SetPermissionsAndOwnership(string sourcePath, string destinationPath)
+        {
+            var escapedSourcePath = EscapeForBash(sourcePath);
+            var escapedDestinationPath = EscapeForBash(destinationPath);
+            // LogAndConsole($"Escaped Source Path:               {escapedSourcePath}");
+            // LogAndConsole($"Escaped Destination Path:          {escapedDestinationPath}");
+
+            // Getting permissions from the source file
+            var getPermsCommand = $"stat -c %a {escapedSourcePath}";
+            // LogAndConsole($"Perms command for Source:          {getPermsCommand}");
+            var permissions = ExecuteBashCommand(getPermsCommand);
+            // LogAndConsole($" --- Returned Perms:               {permissions}");
+
+            // Setting permissions for the destination file
+            var setPermsCommand = $"chmod {permissions} {escapedDestinationPath}";
+            // LogAndConsole($"Set Perms command for Destination: {getPermsCommand}");
+            ExecuteBashCommand(setPermsCommand);
+
+            // Getting ownership from the source file
+            var getOwnerCommand = $"stat -c %U {escapedSourcePath}";
+            // LogAndConsole($"Owner command for Source:          {getOwnerCommand}");
+            var owner = ExecuteBashCommand(getOwnerCommand);
+            // LogAndConsole($" --- Returned Owner:               {owner}");
+
+            var getGroupCommand = $"stat -c %G {escapedSourcePath}";
+            // LogAndConsole($"Group command for Source:          {getGroupCommand}");
+            var group = ExecuteBashCommand(getGroupCommand);
+            // LogAndConsole($" --- Returned Group:               {group}");
+
+            // Setting ownership for the destination file
+            var setOwnerCommand = $"chown {owner}:{group} {escapedDestinationPath}";
+            // LogAndConsole($"Set Owner command for Destination  {getGroupCommand}");
+            ExecuteBashCommand(setOwnerCommand);
+        }
+
+        private string ExecuteBashCommand(string command)
+        {
+            using (var process = new System.Diagnostics.Process())
+            {
+                process.StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "/bin/bash",
+                    Arguments = $"-c \"{command}\"",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+
+                process.Start();
+                string result = process.StandardOutput.ReadToEnd();
+                process.WaitForExit();
+
+                return result.Trim();
+            }
+        }
+
+        private void LogAndConsole(string message)
+        {
+            string logMessage = $"{DateTime.Now}: {message}\n";
+            Console.WriteLine(logMessage);
+            File.AppendAllText(logFile, logMessage);
+        }
+
+        static void Main()
+        {
+            bool initVerState = _CheckVersioningStatus();
+            var fileVersionManager = new FileVersionManager(initVerState);
+            Console.WriteLine("Press Ctrl+C to exit.");
+
+            // Infinite loop to make systemd happy
+            while (true)
+            {
+                Thread.Sleep(Timeout.Infinite);
+            }
+        }
+
     }
 }

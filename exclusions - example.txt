@@ -1,0 +1,2 @@
+﻿^/home/myuser/source/repo/.+\.(sln|csproj|cs)$
+.*/[^/]*_BAK/$

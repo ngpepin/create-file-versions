@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <Compile Remove=".Program~~~~001.cs" />
+    <Compile Remove=".Program~~~~002.cs" />
   </ItemGroup>
 
   <ItemGroup>
