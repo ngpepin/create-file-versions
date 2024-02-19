@@ -108,13 +108,11 @@ namespace FVM
 
         private HashSet<string> allowedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
-    // Microsoft Office
+    // Microsoft Office Core & Legacy Formats
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".mdb", ".accdb", ".pub", ".one", 
-    
-    // Legacy Microsoft Office
-    ".docm", ".dotx", ".dotm", ".xlsm", ".xltm", ".pptm", ".osts",
-    
+    ".mdb", ".accdb", ".pub", ".one", ".pptm", ".osts",
+    ".docm", ".dotx", ".dotm", ".xlsm", ".xltm",  ".xlsb", ".xltb",
+
     // Microsoft OneNote
     ".one",  // OneNote Notebook File
     ".onetoc2", // OneNote Table of Contents File
@@ -270,6 +268,7 @@ namespace FVM
             }
             return versioningEnabled;
         }
+        
         private void CheckVersioningStatus(object state)
         {
             bool old_versioningEnabled = versioningEnabled;
@@ -285,6 +284,43 @@ namespace FVM
                 // LogAndConsole($"File versioning already {(versioningEnabled ? "enabled" : "disabled")}");
             }
 
+        }
+
+        public static async Task<bool> WaitForFileUnlockAsync(string filePath, int timeoutMilliseconds = 3000, int pollIntervalMilliseconds = 500)
+        {
+            var startTime = DateTime.UtcNow;
+
+            while ((DateTime.UtcNow - startTime).TotalMilliseconds < timeoutMilliseconds)
+            {
+                if (!IsFileLocked(filePath))
+                {
+                    // File is not locked, return true.
+                    return true;
+                }
+
+                // Wait for the specified interval before checking again.
+                await Task.Delay(pollIntervalMilliseconds);
+            }
+
+            // Timeout reached, file is still locked, return false.
+            return false;
+        }
+        
+        private static bool IsFileLocked(string filePath)
+        {
+            try
+            {
+                using (FileStream stream = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    // If the file can be opened for reading without sharing, it's not locked by another process.
+                }
+            }
+            catch (IOException)
+            {
+                // The file is in use by another process or cannot be accessed, indicating it's locked.
+                return true;
+            }
+            return false; // If no exception was thrown, the file is not locked.
         }
 
         private void OnChanged(object source, FileSystemEventArgs e)
@@ -319,6 +355,13 @@ namespace FVM
                 return;
             }
 
+            bool fileUnlocked = WaitForFileUnlockAsync(filePath).GetAwaiter().GetResult();
+            if (!fileUnlocked)
+            {
+                LogAndConsole("-> File is busy even after waiting a while; it may not get versioned");
+                return;
+            }
+
             CleanupCompletedTasks();
 
             if (!fileTasks.ContainsKey(filePath))
@@ -339,7 +382,7 @@ namespace FVM
         private bool IsTemporaryFile(string fileName)
         {
             // Check for standard temporary file patterns
-            if (fileName.StartsWith("~$") || fileName.StartsWith(".~"))
+            if (fileName.StartsWith("~$") || fileName.StartsWith(".~$") || fileName.Contains("~~~~"))
             {
                 return true;
             }

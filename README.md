@@ -44,7 +44,6 @@ The `FileVersionManager` program supports the use of an external file, `exclusio
 The exclusions file is located in a specific directory:
 
 ```
-arduinoCopy code
 /home/npepin/.create-file-versions/exclusions.txt
 ```
 
@@ -59,7 +58,6 @@ Each line in the `exclusions.txt` file represents a regex pattern that defines a
 1. **Ignore Specific Directories**:
 
    ```
-   regexCopy code
    ^/mnt/mydrive/nextcloud/files/Junk/.*
    ```
 
@@ -68,7 +66,6 @@ Each line in the `exclusions.txt` file represents a regex pattern that defines a
 2. **Ignore Specific File Extensions in a Directory**:
 
    ```
-   regexCopy code
    ^/mnt/mydrive/Finances/.+\.(xlsx|xlsm)$
    ```
 
@@ -77,7 +74,6 @@ Each line in the `exclusions.txt` file represents a regex pattern that defines a
 3. **Ignore Backup Directories**:
 
    ```
-   regexCopy code
    .*/[^/]*_BAK/$
    ```
 
@@ -86,7 +82,6 @@ Each line in the `exclusions.txt` file represents a regex pattern that defines a
 4. **Complex Path Exclusions**:
 
    ```
-   regexCopy code
    this is a directory/_____New/Apps/.*
    ```
 
